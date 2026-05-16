@@ -1,0 +1,25 @@
+# Vegeta targets — POST /fraud-score
+# Uso: vegeta attack -targets=tests/targets.txt -rate=100 -duration=30s | vegeta report
+
+# Caso 1: transação legítima — valor dentro da média, comerciante conhecido, terminal presencial
+POST http://localhost:3000/fraud-score
+Content-Type: application/json
+@tests/payloads/legitimate.json
+
+# Caso 2: transação suspeita — valor muito acima da média, novo comerciante, terminal remoto
+POST http://localhost:3000/fraud-score
+Content-Type: application/json
+@tests/payloads/suspicious_high_amount.json
+
+# Caso 3: transação suspeita — muitas transações nas últimas 24h (velocity)
+POST http://localhost:3000/fraud-score
+Content-Type: application/json
+@tests/payloads/suspicious_velocity.json
+
+# Caso 4: transação suspeita — distância impossível (viagem rápida demais)
+POST http://localhost:3000/fraud-score
+Content-Type: application/json
+@tests/payloads/suspicious_impossible_travel.json
+
+# Caso 5: health check
+GET http://localhost:3000/ready

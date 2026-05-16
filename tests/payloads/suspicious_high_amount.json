@@ -1,0 +1,24 @@
+{
+  "id": "tx-002",
+  "transaction": {
+    "amount": 9800.00,
+    "installments": 1,
+    "requested_at": "2026-05-16T03:15:00Z"
+  },
+  "customer": {
+    "avg_amount": 200.00,
+    "tx_count_24h": 1,
+    "known_merchants": ["merch-abc"]
+  },
+  "merchant": {
+    "id": "merch-unknown-999",
+    "mcc": "7995",
+    "avg_amount": 500.00
+  },
+  "terminal": {
+    "is_online": true,
+    "card_present": false,
+    "km_from_home": 320.0
+  },
+  "last_transaction": null
+}
