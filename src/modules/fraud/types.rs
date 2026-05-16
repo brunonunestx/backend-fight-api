@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Serialize)]
+pub struct FraudResult {
+    pub approved: bool,
+    pub fraud_score: f32,
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 pub struct TxDetails {
     pub amount: f64,

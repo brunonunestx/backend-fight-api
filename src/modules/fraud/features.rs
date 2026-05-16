@@ -60,19 +60,19 @@ pub fn vectorize(tx: &Transaction, mcc_risk: &HashMap<String, f32>) -> [f32; 14]
     let mcc_risk_val = *mcc_risk.get(&tx.merchant.mcc).unwrap_or(&0.5);
 
     [
-        limit(tx.transaction.amount as f32 / MAX_AMOUNT),                                              // 0: amount
-        limit(tx.transaction.installments as f32 / MAX_INSTALLMENTS),                                  // 1: installments
-        limit((tx.transaction.amount as f32 / tx.customer.avg_amount as f32) / AMOUNT_VS_AVG_RATIO),   // 2: amount_vs_avg
-        hour,                                                                                           // 3: hour_of_day
-        day,                                                                                            // 4: day_of_week
-        minutes_since_last,                                                                             // 5: minutes_since_last_tx
-        km_from_last,                                                                                   // 6: km_from_last_tx
-        limit(tx.terminal.km_from_home as f32 / MAX_KM),                                               // 7: km_from_home
-        limit(tx.customer.tx_count_24h as f32 / MAX_TX_COUNT_24H),                                     // 8: tx_count_24h
-        if tx.terminal.is_online { 1.0 } else { 0.0 },                                                 // 9: is_online
-        if tx.terminal.card_present { 1.0 } else { 0.0 },                                              // 10: card_present
-        unknown_merchant,                                                                               // 11: unknown_merchant
-        mcc_risk_val,                                                                                   // 12: mcc_risk
-        limit(tx.merchant.avg_amount as f32 / MAX_MERCHANT_AVG_AMOUNT),                                // 13: merchant_avg_amount
+        limit(tx.transaction.amount as f32 / MAX_AMOUNT),
+        limit(tx.transaction.installments as f32 / MAX_INSTALLMENTS),
+        limit((tx.transaction.amount as f32 / tx.customer.avg_amount as f32) / AMOUNT_VS_AVG_RATIO),
+        hour,
+        day,
+        minutes_since_last,
+        km_from_last,
+        limit(tx.terminal.km_from_home as f32 / MAX_KM),
+        limit(tx.customer.tx_count_24h as f32 / MAX_TX_COUNT_24H),
+        if tx.terminal.is_online { 1.0 } else { 0.0 },
+        if tx.terminal.card_present { 1.0 } else { 0.0 },
+        unknown_merchant,
+        mcc_risk_val,
+        limit(tx.merchant.avg_amount as f32 / MAX_MERCHANT_AVG_AMOUNT),
     ]
 }
