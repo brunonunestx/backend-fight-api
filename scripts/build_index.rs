@@ -9,7 +9,7 @@ use rand_distr::{Distribution, Normal, Uniform};
 use serde::{Deserialize, Serialize};
 
 const DIM: usize = 14;
-const L: usize = 7;
+const L: usize = 4;
 const K_HASH: usize = 8;
 const W: f32 = 1.0;
 
