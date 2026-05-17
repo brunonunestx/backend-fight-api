@@ -1,6 +1,6 @@
 pub mod features;
 pub mod handler;
-pub mod lsh;
+pub mod ivf;
 pub mod routes;
 pub mod service;
 pub mod types;

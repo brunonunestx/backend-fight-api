@@ -1,25 +1,21 @@
 use std::{
-    collections::HashMap,
     fs::File,
     io::{BufReader, BufWriter, Write},
 };
 
-use rand::{SeedableRng, rngs::SmallRng};
-use rand_distr::{Distribution, Normal, Uniform};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand_distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 
 const DIM: usize = 14;
-const L: usize = 4;
-const K_HASH: usize = 8;
-const W: f32 = 1.0;
+const NLIST: usize = 64;
+const MAX_ITER: usize = 25;
 
-// Deve ser idêntico ao LshIndex em src/modules/fraud/lsh.rs
+// Deve ser idêntico ao IvfIndex em src/modules/fraud/ivf.rs
 #[derive(Serialize, Deserialize)]
-struct LshIndex {
-    inv_w: f32,
-    projections: Vec<Vec<[f32; DIM]>>,
-    offsets: Vec<Vec<f32>>,
-    tables: Vec<HashMap<u64, Vec<u32>>>,
+struct IvfIndex {
+    centroids: Vec<[f32; DIM]>,
+    lists: Vec<Vec<u32>>,
     labels: Vec<u8>,
 }
 
@@ -41,15 +37,86 @@ fn label_to_u8(label: &str) -> u8 {
     }
 }
 
-fn bucket_key(projections: &[[f32; DIM]], offsets: &[f32], inv_w: f32, v: &[f32; DIM]) -> u64 {
-    projections
+fn l2_sq(a: &[f32; DIM], b: &[f32; DIM]) -> f32 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| { let d = x - y; d * d }).sum()
+}
+
+fn nearest(v: &[f32; DIM], centroids: &[[f32; DIM]]) -> usize {
+    centroids
         .iter()
-        .zip(offsets.iter())
-        .fold(0u64, |acc, (proj, offset)| {
-            let dot: f32 = proj.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
-            let bucket = ((dot + offset) * inv_w).floor() as i32;
-            acc.wrapping_mul(2654435761).wrapping_add(bucket as u64)
-        })
+        .enumerate()
+        .map(|(i, c)| (i, l2_sq(v, c)))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .unwrap()
+        .0
+}
+
+fn kmeans(vectors: &[[f32; DIM]], rng: &mut SmallRng) -> Vec<[f32; DIM]> {
+    let n = vectors.len();
+
+    // k-means++ initialization
+    let first = rng.gen_range(0..n);
+    let mut centroids: Vec<[f32; DIM]> = vec![vectors[first]];
+
+    for k in 1..NLIST {
+        let dists: Vec<f32> = vectors
+            .iter()
+            .map(|v| centroids.iter().map(|c| l2_sq(v, c)).fold(f32::MAX, f32::min))
+            .collect();
+
+        let total: f32 = dists.iter().sum();
+        let mut threshold = Uniform::new(0.0f32, total).sample(rng);
+
+        let mut chosen = n - 1;
+        for (i, &d) in dists.iter().enumerate() {
+            threshold -= d;
+            if threshold <= 0.0 {
+                chosen = i;
+                break;
+            }
+        }
+        centroids.push(vectors[chosen]);
+        println!("kmeans++ init: {}/{NLIST}", k + 1);
+    }
+
+    // Lloyd's iterations
+    let mut assignments = vec![0usize; n];
+
+    for iter in 0..MAX_ITER {
+        let mut changed = 0usize;
+        for (i, v) in vectors.iter().enumerate() {
+            let c = nearest(v, &centroids);
+            if c != assignments[i] {
+                assignments[i] = c;
+                changed += 1;
+            }
+        }
+        println!("kmeans iter {}/{MAX_ITER}: {changed} reassigned", iter + 1);
+        if changed == 0 {
+            break;
+        }
+
+        let mut sums: Vec<[f32; DIM]> = vec![[0.0f32; DIM]; NLIST];
+        let mut counts = vec![0usize; NLIST];
+
+        for (i, v) in vectors.iter().enumerate() {
+            let c = assignments[i];
+            for j in 0..DIM {
+                sums[c][j] += v[j];
+            }
+            counts[c] += 1;
+        }
+
+        for c in 0..NLIST {
+            if counts[c] > 0 {
+                for j in 0..DIM {
+                    centroids[c][j] = sums[c][j] / counts[c] as f32;
+                }
+            }
+        }
+    }
+
+    centroids
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -60,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     std::fs::create_dir_all("src/data")?;
 
-    // --- vectors.bin (u8) + labels.bin ---
+    // --- vectors.bin + labels.bin ---
     let mut vectors_writer = BufWriter::new(File::create("src/data/vectors.bin")?);
     let mut labels_writer = BufWriter::new(File::create("src/data/labels.bin")?);
 
@@ -79,42 +146,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     labels_writer.flush()?;
     println!("flat index written (vectors.bin + labels.bin)");
 
-    // --- lsh index ---
-    println!("building lsh index (L={L}, K={K_HASH}, w={W})...");
+    // --- IVF index ---
+    println!("building IVF index (nlist={NLIST}, max_iter={MAX_ITER})...");
 
+    let float_vecs: Vec<[f32; DIM]> = records.iter().map(|r| r.vector).collect();
     let mut rng = SmallRng::seed_from_u64(42);
-    let normal = Normal::new(0.0f32, 1.0)?;
-    let uniform = Uniform::new(0.0f32, W);
 
-    let projections: Vec<Vec<[f32; DIM]>> = (0..L)
-        .map(|_| (0..K_HASH)
-            .map(|_| std::array::from_fn(|_| normal.sample(&mut rng)))
-            .collect())
-        .collect();
+    let centroids = kmeans(&float_vecs, &mut rng);
 
-    let offsets: Vec<Vec<f32>> = (0..L)
-        .map(|_| (0..K_HASH).map(|_| uniform.sample(&mut rng)).collect())
-        .collect();
-
-    let mut tables: Vec<HashMap<u64, Vec<u32>>> = vec![HashMap::new(); L];
-
-    for (i, record) in records.iter().enumerate() {
-        for t in 0..L {
-            let key = bucket_key(&projections[t], &offsets[t], 1.0 / W, &record.vector);
-            tables[t].entry(key).or_default().push(i as u32);
-        }
-        if (i + 1) % 100_000 == 0 {
-            println!("lsh: {} / {total}", i + 1);
-        }
+    println!("building inverted lists...");
+    let mut lists: Vec<Vec<u32>> = vec![Vec::new(); NLIST];
+    for (i, v) in float_vecs.iter().enumerate() {
+        let c = nearest(v, &centroids);
+        lists[c].push(i as u32);
     }
 
-    let index = LshIndex { inv_w: 1.0 / W, projections, offsets, tables, labels };
+    let sizes: Vec<usize> = lists.iter().map(|l| l.len()).collect();
+    println!(
+        "cluster sizes: min={}, max={}, avg={:.0}",
+        sizes.iter().min().unwrap(),
+        sizes.iter().max().unwrap(),
+        sizes.iter().sum::<usize>() as f64 / NLIST as f64,
+    );
 
+    let index = IvfIndex { centroids, lists, labels };
     let encoded = bincode::serialize(&index)?;
-    std::fs::write("src/data/lsh.bin", &encoded)?;
-    println!("lsh.bin: {:.1} MB", encoded.len() as f64 / 1_048_576.0);
-
+    std::fs::write("src/data/ivf.bin", &encoded)?;
+    println!("ivf.bin: {:.1} MB", encoded.len() as f64 / 1_048_576.0);
     println!("vectors.bin: {:.1} MB", (total * DIM) as f64 / 1_048_576.0);
     println!("done — {total} vectors indexed");
+
     Ok(())
 }
