@@ -10,4 +10,5 @@ FROM alpine:3.21
 WORKDIR /app
 COPY --from=builder /app/target/release/backend-fight ./backend-fight
 COPY src/data ./src/data
+COPY src/dataset ./src/dataset
 CMD ["./backend-fight"]
