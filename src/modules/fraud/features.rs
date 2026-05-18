@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use chrono::{Datelike, Timelike};
 
 use super::types::{Transaction, fnv_hash};
@@ -11,6 +9,26 @@ const MAX_MINUTES: f32 = 1_440.0;
 const MAX_KM: f32 = 1_000.0;
 const MAX_TX_COUNT_24H: f32 = 20.0;
 const MAX_MERCHANT_AVG_AMOUNT: f32 = 10_000.0;
+
+const MCC_RISK: &[(&str, f32)] = &[
+    ("4511", 0.35),
+    ("5311", 0.25),
+    ("5411", 0.15),
+    ("5812", 0.30),
+    ("5912", 0.20),
+    ("5944", 0.45),
+    ("5999", 0.50),
+    ("7801", 0.80),
+    ("7802", 0.75),
+    ("7995", 0.85),
+];
+
+pub fn mcc_risk(mcc: &str) -> f32 {
+    MCC_RISK
+        .binary_search_by_key(&mcc, |&(k, _)| k)
+        .map(|i| MCC_RISK[i].1)
+        .unwrap_or(0.5)
+}
 
 fn limit(x: f32) -> f32 {
     x.clamp(0.0, 1.0)
@@ -24,7 +42,7 @@ pub fn quantize_vector(vector: &[f32; 14]) -> [u8; 14] {
     std::array::from_fn(|i| quantize(vector[i]))
 }
 
-pub fn vectorize(tx: &Transaction, mcc_risk: &HashMap<String, f32>) -> [f32; 14] {
+pub fn vectorize(tx: &Transaction) -> [f32; 14] {
     let requested_at = tx.transaction.requested_at;
 
     let hour = requested_at.hour() as f32 / 23.0;
@@ -48,7 +66,7 @@ pub fn vectorize(tx: &Transaction, mcc_risk: &HashMap<String, f32>) -> [f32; 14]
         1.0
     };
 
-    let mcc_risk_val = *mcc_risk.get(&tx.merchant.mcc).unwrap_or(&0.5);
+    let mcc_risk_val = mcc_risk(&tx.merchant.mcc);
 
     [
         limit(tx.transaction.amount as f32 / MAX_AMOUNT),
