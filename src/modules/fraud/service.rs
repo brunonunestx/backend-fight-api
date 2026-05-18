@@ -6,7 +6,8 @@ use super::features::{quantize_vector, vectorize};
 use super::ivf::IvfIndex;
 
 const K: usize = 5;
-const NPROBE: usize = 8;
+const NPROBE: usize = 2;
+const NPROBE_COARSE: usize = 2;
 
 pub struct FraudService {
     mcc_risk: HashMap<String, f32>,
@@ -35,10 +36,7 @@ impl FraudService {
         let vector_f32 = vectorize(transaction, &self.mcc_risk);
         let vector_u8 = quantize_vector(&vector_f32);
 
-        let neighbours =
-            self.index.search(&vector_f32, &vector_u8, &self.vectors, K, NPROBE);
-
-        let fraud_count = neighbours.iter().filter(|(_, label)| *label == 1).count();
+        let fraud_count = self.index.search(&vector_f32, &vector_u8, &self.vectors, K, NPROBE, NPROBE_COARSE);
         let fraud_score = fraud_count as f32 / K as f32;
 
         FraudResult { approved: fraud_count <= K / 2, fraud_score }

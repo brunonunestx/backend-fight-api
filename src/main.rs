@@ -1,5 +1,8 @@
 mod modules;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use axum::Router;
 use std::sync::Arc;
 

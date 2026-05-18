@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{Datelike, Timelike};
 
-use super::types::Transaction;
+use super::types::{Transaction, fnv_hash};
 
 const MAX_AMOUNT: f32 = 10_000.0;
 const MAX_INSTALLMENTS: f32 = 12.0;
@@ -25,23 +25,14 @@ pub fn quantize_vector(vector: &[f32; 14]) -> [u8; 14] {
 }
 
 pub fn vectorize(tx: &Transaction, mcc_risk: &HashMap<String, f32>) -> [f32; 14] {
-    let requested_at = tx
-        .transaction
-        .requested_at
-        .parse::<DateTime<Utc>>()
-        .unwrap_or_default();
+    let requested_at = tx.transaction.requested_at;
 
     let hour = requested_at.hour() as f32 / 23.0;
     let day = requested_at.weekday().num_days_from_monday() as f32 / 6.0;
 
     let (minutes_since_last, km_from_last) = match &tx.last_transaction {
         Some(last) => {
-            let last_at = last
-                .timestamp
-                .parse::<DateTime<Utc>>()
-                .unwrap_or_default();
-
-            let minutes = (requested_at - last_at).num_minutes() as f32;
+            let minutes = (requested_at - last.timestamp).num_minutes() as f32;
 
             (
                 limit(minutes / MAX_MINUTES),
@@ -51,7 +42,7 @@ pub fn vectorize(tx: &Transaction, mcc_risk: &HashMap<String, f32>) -> [f32; 14]
         None => (-1.0, -1.0),
     };
 
-    let unknown_merchant = if tx.customer.known_merchants.contains(&tx.merchant.id) {
+    let unknown_merchant = if tx.customer.known_merchants.contains(&fnv_hash(&tx.merchant.id)) {
         0.0
     } else {
         1.0
