@@ -8,6 +8,12 @@ default-run = "backend-fight"
 name = "build_index"
 path = "scripts/build_index.rs"
 
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }
 axum = "0.8.9"

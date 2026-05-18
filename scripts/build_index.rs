@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufReader, BufWriter, Write},
+    io::{BufWriter, Write},
 };
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
@@ -10,17 +10,16 @@ use serde::{Deserialize, Serialize};
 
 const DIM: usize = 14;
 const NLIST: usize = 16384;
-const NLIST_COARSE: usize = 128; // sqrt(NLIST)
+const NLIST_COARSE: usize = 128;
 const MAX_ITER: usize = 25;
 const MAX_ITER_COARSE: usize = 50;
 
-// Deve ser idêntico ao IvfIndex em src/modules/fraud/ivf.rs
 #[derive(Serialize, Deserialize)]
 struct IvfIndex {
     coarse_centroids: Vec<[f32; DIM]>,
     coarse_to_fine: Vec<Vec<u32>>,
     centroids: Vec<[f32; DIM]>,
-    lists: Vec<Vec<u32>>,
+    offsets: Vec<(u32, u32)>,
     labels: Vec<u8>,
 }
 
@@ -59,7 +58,6 @@ fn nearest(v: &[f32; DIM], centroids: &[[f32; DIM]]) -> usize {
 fn kmeans(vectors: &[[f32; DIM]], nlist: usize, max_iter: usize, rng: &mut SmallRng) -> Vec<[f32; DIM]> {
     let n = vectors.len();
 
-    // k-means++ initialization
     let first = rng.gen_range(0..n);
     let mut centroids: Vec<[f32; DIM]> = vec![vectors[first]];
     let mut min_dists: Vec<f32> = vectors.par_iter().map(|v| l2_sq(v, &centroids[0])).collect();
@@ -88,7 +86,6 @@ fn kmeans(vectors: &[[f32; DIM]], nlist: usize, max_iter: usize, rng: &mut Small
         }
     }
 
-    // Lloyd's iterations
     let mut assignments: Vec<usize> = vec![0usize; n];
 
     for iter in 0..max_iter {
@@ -142,38 +139,21 @@ fn kmeans(vectors: &[[f32; DIM]], nlist: usize, max_iter: usize, rng: &mut Small
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = File::open("src/dataset/references.json")?;
-    let records: Vec<Record> = serde_json::from_reader(BufReader::new(input))?;
+    let records: Vec<Record> = serde_json::from_reader(std::io::BufReader::new(input))?;
     let total = records.len();
     println!("loaded {total} records");
 
     std::fs::create_dir_all("src/data")?;
 
-    // --- vectors.bin + labels.bin ---
-    let mut vectors_writer = BufWriter::new(File::create("src/data/vectors.bin")?);
-    let mut labels_writer = BufWriter::new(File::create("src/data/labels.bin")?);
-
-    let labels: Vec<u8> = records.iter().map(|r| label_to_u8(&r.label)).collect();
-
-    for (i, record) in records.iter().enumerate() {
-        let quantized: [u8; DIM] = std::array::from_fn(|j| quantize(record.vector[j]));
-        vectors_writer.write_all(&quantized)?;
-        labels_writer.write_all(&[labels[i]])?;
-
-        if (i + 1) % 100_000 == 0 {
-            println!("flat: {} / {total}", i + 1);
-        }
-    }
-    vectors_writer.flush()?;
-    labels_writer.flush()?;
-    println!("flat index written (vectors.bin + labels.bin)");
-
-    // --- fine IVF centroids ---
-    println!("building fine IVF centroids (nlist={NLIST}, max_iter={MAX_ITER})...");
     let float_vecs: Vec<[f32; DIM]> = records.iter().map(|r| r.vector).collect();
+    let raw_labels: Vec<u8> = records.iter().map(|r| label_to_u8(&r.label)).collect();
+
+    // fine IVF centroids
+    println!("building fine IVF centroids (nlist={NLIST}, max_iter={MAX_ITER})...");
     let mut rng = SmallRng::seed_from_u64(42);
     let centroids = kmeans(&float_vecs, NLIST, MAX_ITER, &mut rng);
 
-    // --- coarse centroids over fine centroids ---
+    // coarse centroids
     println!("building coarse centroids (nlist_coarse={NLIST_COARSE}, max_iter={MAX_ITER_COARSE})...");
     let coarse_centroids = kmeans(&centroids, NLIST_COARSE, MAX_ITER_COARSE, &mut rng);
 
@@ -196,15 +176,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         coarse_sizes.iter().sum::<usize>() as f64 / NLIST_COARSE as f64,
     );
 
-    // --- inverted lists for fine centroids ---
-    println!("building inverted lists...");
+    // assign each vector to its nearest fine cluster
+    println!("assigning vectors to fine clusters...");
     let cluster_ids: Vec<usize> = float_vecs.par_iter().map(|v| nearest(v, &centroids)).collect();
-    let mut lists: Vec<Vec<u32>> = vec![Vec::new(); NLIST];
-    for (i, c) in cluster_ids.iter().enumerate() {
-        lists[*c].push(i as u32);
-    }
 
-    let sizes: Vec<usize> = lists.iter().map(|l| l.len()).collect();
+    let sizes: Vec<usize> = {
+        let mut counts = vec![0usize; NLIST];
+        for &c in &cluster_ids { counts[c] += 1; }
+        counts
+    };
     println!(
         "fine cluster sizes: min={}, max={}, avg={:.0}",
         sizes.iter().min().unwrap(),
@@ -212,11 +192,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sizes.iter().sum::<usize>() as f64 / NLIST as f64,
     );
 
-    let index = IvfIndex { coarse_centroids, coarse_to_fine, centroids, lists, labels };
+    // compute offsets (start position of each cluster in the reordered vectors.bin)
+    let mut offsets: Vec<(u32, u32)> = Vec::with_capacity(NLIST);
+    let mut cursor: u32 = 0;
+    for &count in &sizes {
+        offsets.push((cursor, count as u32));
+        cursor += count as u32;
+    }
+
+    // place vectors and labels in cluster order
+    println!("reordering vectors by cluster...");
+    let mut sorted_vectors: Vec<[u8; DIM]> = vec![[0u8; DIM]; total];
+    let mut sorted_labels: Vec<u8> = vec![0u8; total];
+    let mut write_pos: Vec<u32> = offsets.iter().map(|&(s, _)| s).collect();
+
+    for (i, &c) in cluster_ids.iter().enumerate() {
+        let p = write_pos[c] as usize;
+        sorted_vectors[p] = std::array::from_fn(|j| quantize(float_vecs[i][j]));
+        sorted_labels[p] = raw_labels[i];
+        write_pos[c] += 1;
+    }
+
+    // write vectors.bin in cluster order
+    let mut vectors_writer = BufWriter::new(File::create("src/data/vectors.bin")?);
+    for v in &sorted_vectors {
+        vectors_writer.write_all(v)?;
+    }
+    vectors_writer.flush()?;
+    println!("vectors.bin written in cluster order ({:.1} MB)", (total * DIM) as f64 / 1_048_576.0);
+
+    let index = IvfIndex { coarse_centroids, coarse_to_fine, centroids, offsets, labels: sorted_labels };
     let encoded = bincode::serialize(&index)?;
     std::fs::write("src/data/ivf.bin", &encoded)?;
     println!("ivf.bin: {:.1} MB", encoded.len() as f64 / 1_048_576.0);
-    println!("vectors.bin: {:.1} MB", (total * DIM) as f64 / 1_048_576.0);
     println!("done — {total} vectors indexed");
 
     Ok(())

@@ -9,7 +9,7 @@ pub struct IvfIndex {
     pub coarse_centroids: Vec<[f32; DIM]>,
     pub coarse_to_fine: Vec<Vec<u32>>,
     pub centroids: Vec<[f32; DIM]>,
-    pub lists: Vec<Vec<u32>>,
+    pub offsets: Vec<(u32, u32)>,
     pub labels: Vec<u8>,
 }
 
@@ -29,10 +29,12 @@ impl IvfIndex {
         thread_local! {
             static COARSE_BUF: RefCell<Vec<(usize, f32)>> = RefCell::new(Vec::new());
             static FINE_BUF: RefCell<Vec<(usize, f32)>> = RefCell::new(Vec::new());
+            static HEAP_BUF: RefCell<BinaryHeap<(u32, u8)>> = RefCell::new(BinaryHeap::new());
         }
 
         COARSE_BUF.with(|coarse_cell| {
             FINE_BUF.with(|fine_cell| {
+            HEAP_BUF.with(|heap_cell| {
                 let mut coarse_dists = coarse_cell.borrow_mut();
                 coarse_dists.clear();
                 coarse_dists.extend(
@@ -62,14 +64,16 @@ impl IvfIndex {
                     fine_dists.truncate(nprobe);
                 }
 
-                let mut heap: BinaryHeap<(u32, u8)> = BinaryHeap::with_capacity(k + 1);
+                let mut heap = heap_cell.borrow_mut();
+                heap.clear();
                 let mut fraud_in_heap: usize = 0;
 
-                for (fi, _) in fine_dists.iter() {
-                    for &id in &self.lists[*fi] {
-                        let start = id as usize * DIM;
-                        let dist = l2_sq_u8(query_u8, &vectors[start..start + DIM]);
-                        let label = self.labels[id as usize];
+                for &(fi, _) in fine_dists.iter() {
+                    let (start, count) = self.offsets[fi];
+                    for pos in start..start + count {
+                        let byte_start = pos as usize * DIM;
+                        let dist = l2_sq_u8(query_u8, &vectors[byte_start..byte_start + DIM]);
+                        let label = self.labels[pos as usize];
 
                         if heap.len() < k {
                             heap.push((dist, label));
@@ -86,6 +90,7 @@ impl IvfIndex {
                 }
 
                 fraud_in_heap
+            })
             })
         })
     }
