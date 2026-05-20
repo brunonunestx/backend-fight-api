@@ -12,7 +12,7 @@ pub struct AppState {
     pub fraud_service: Arc<FraudService>,
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() {
     let service = Arc::new(FraudService::new());
     let state = Arc::new(AppState { fraud_service: service });

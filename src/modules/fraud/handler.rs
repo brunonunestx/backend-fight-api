@@ -8,8 +8,6 @@ pub async fn detect_fraud(
     State(app_state): State<Arc<AppState>>,
     Json(payload): Json<Transaction>,
 ) -> Json<FraudResult> {
-    let result = tokio::task::block_in_place(|| {
-        app_state.fraud_service.detect_fraud(&payload)
-    });
+    let result = app_state.fraud_service.detect_fraud(&payload);
     Json(result)
 }
