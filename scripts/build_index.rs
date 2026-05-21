@@ -1,17 +1,13 @@
 use std::{fs::File, io::{BufWriter, Write}};
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
-use rand_distr::{Distribution, Uniform};
 use rayon::prelude::*;
 use serde::Deserialize;
 
 const DIM: usize = 14;
-const SLOTS_PER_CLUSTER: usize = 10;
-const M: usize = 2;
-const N_ENTRY_POINTS: usize = 128;
+const NLIST: usize = 16384;
+const N_COARSE: usize = 64; // sqrt(NLIST) — 64 coarse + 64 fine = 128 L2/query
 const MAX_ITER: usize = 25;
-// each coarse bucket holds ~GRAPH_COARSE_FACTOR fine centroids during graph construction
-const GRAPH_COARSE_FACTOR: usize = 300;
 
 #[derive(Debug, Deserialize)]
 struct Record {
@@ -35,10 +31,6 @@ fn l2_sq(a: &[f32; DIM], b: &[f32; DIM]) -> f32 {
     a.iter().zip(b).map(|(&x, &y)| { let d = x - y; d * d }).sum()
 }
 
-fn l2(a: &[f32; DIM], b: &[f32; DIM]) -> f32 {
-    l2_sq(a, b).sqrt()
-}
-
 fn nearest_idx(v: &[f32; DIM], cs: &[[f32; DIM]]) -> usize {
     cs.iter().enumerate()
         .map(|(i, c)| (i, l2_sq(v, c)))
@@ -48,6 +40,8 @@ fn nearest_idx(v: &[f32; DIM], cs: &[[f32; DIM]]) -> usize {
 }
 
 fn kmeans(vectors: &[[f32; DIM]], nlist: usize, max_iter: usize, rng: &mut SmallRng) -> Vec<[f32; DIM]> {
+    use rand_distr::{Distribution, Uniform};
+
     let n = vectors.len();
     assert!(nlist <= n, "nlist={nlist} > n={n}");
 
@@ -71,7 +65,7 @@ fn kmeans(vectors: &[[f32; DIM]], nlist: usize, max_iter: usize, rng: &mut Small
         }
         centroids.push(vectors[chosen]);
 
-        if (k + 1) % 10_000 == 0 || k + 1 == nlist {
+        if (k + 1) % 512 == 0 || k + 1 == nlist {
             println!("  kmeans++ init {}/{nlist}", k + 1);
         }
     }
@@ -119,107 +113,6 @@ fn kmeans(vectors: &[[f32; DIM]], nlist: usize, max_iter: usize, rng: &mut Small
     centroids
 }
 
-// For small n: brute-force O(n²) parallel.
-// For large n: coarse bucketing — find M nearest within same coarse bucket + 2 adjacent.
-fn build_knn_graph(centroids: &[[f32; DIM]], rng: &mut SmallRng) -> Vec<[(u32, f32); M]> {
-    let n = centroids.len();
-
-    if n <= 20_000 {
-        println!("  brute-force k-NN ({n} nodes)...");
-        return centroids.par_iter().enumerate()
-            .map(|(i, ci)| {
-                let mut best: [(u32, f32); M] = [(u32::MAX, f32::MAX); M];
-                for (j, cj) in centroids.iter().enumerate() {
-                    if j == i { continue; }
-                    let d = l2(ci, cj);
-                    if d < best[M - 1].1 {
-                        best[M - 1] = (j as u32, d);
-                        best.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                    }
-                }
-                best
-            })
-            .collect();
-    }
-
-    let coarse_n = (n / GRAPH_COARSE_FACTOR).clamp(64, 4096);
-    println!("  coarse k-NN index: {coarse_n} buckets (~{GRAPH_COARSE_FACTOR} per bucket)...");
-    let coarse_centroids = kmeans(centroids, coarse_n, 10, rng);
-
-    let coarse_asgn: Vec<usize> = centroids.par_iter()
-        .map(|c| nearest_idx(c, &coarse_centroids))
-        .collect();
-
-    let mut coarse_buckets: Vec<Vec<usize>> = vec![Vec::new(); coarse_n];
-    for (i, &ci) in coarse_asgn.iter().enumerate() {
-        coarse_buckets[ci].push(i);
-    }
-
-    // 2 nearest coarse neighbours per coarse centroid (for expanding search)
-    let coarse_adj: Vec<[usize; 2]> = coarse_centroids.par_iter().enumerate()
-        .map(|(i, c)| {
-            let mut best = [(usize::MAX, f32::MAX); 2];
-            for (j, other) in coarse_centroids.iter().enumerate() {
-                if j == i { continue; }
-                let d = l2_sq(c, other);
-                if d < best[1].1 {
-                    best[1] = (j, d);
-                    if best[1].1 < best[0].1 { best.swap(0, 1); }
-                }
-            }
-            [best[0].0, best[1].0]
-        })
-        .collect();
-
-    println!("  finding M={M} neighbors per centroid...");
-    centroids.par_iter().enumerate()
-        .map(|(i, ci_vec)| {
-            let ci = coarse_asgn[i];
-            let mut best: [(u32, f32); M] = [(u32::MAX, f32::MAX); M];
-
-            for bucket_ci in [ci, coarse_adj[ci][0], coarse_adj[ci][1]] {
-                if bucket_ci == usize::MAX { continue; }
-                for &j in &coarse_buckets[bucket_ci] {
-                    if j == i { continue; }
-                    let d = l2(ci_vec, &centroids[j]);
-                    if d < best[M - 1].1 {
-                        best[M - 1] = (j as u32, d);
-                        best.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                    }
-                }
-            }
-            best
-        })
-        .collect()
-}
-
-fn farthest_point_sampling(centroids: &[[f32; DIM]], n: usize, rng: &mut SmallRng) -> Vec<u32> {
-    let total = centroids.len();
-    let mut eps: Vec<u32> = Vec::with_capacity(n);
-    let first = rng.gen_range(0..total);
-    eps.push(first as u32);
-
-    let mut min_dists: Vec<f32> = centroids.iter()
-        .map(|c| l2(c, &centroids[first]))
-        .collect();
-
-    for _ in 1..n {
-        let farthest = min_dists.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .unwrap()
-            .0;
-        eps.push(farthest as u32);
-
-        let ep_vec = &centroids[farthest];
-        min_dists.par_iter_mut().zip(centroids.par_iter()).for_each(|(md, c)| {
-            let d = l2(c, ep_vec);
-            if d < *md { *md = d; }
-        });
-    }
-
-    eps
-}
-
 // centroids.bin: [n:u32][dim:u32][n × dim × f32]
 fn write_centroids_bin(centroids: &[[f32; DIM]], path: &str) -> std::io::Result<()> {
     let mut w = BufWriter::new(File::create(path)?);
@@ -231,8 +124,54 @@ fn write_centroids_bin(centroids: &[[f32; DIM]], path: &str) -> std::io::Result<
     w.flush()
 }
 
-// ivf.bin: [n:u32][slots:u32][dim:u32] then per cluster: [count:u32][slots×dim×u8][slots×u8]
-// stride = 4 + SLOTS_PER_CLUSTER × (DIM + 1); offset(i) = 12 + i × stride
+// coarse.bin format:
+//   [n_coarse:u32][n_fine:u32][dim:u32]   12 bytes
+//   [n_coarse × dim × f32]                coarse centroids
+//   per coarse bucket (n_coarse entries):
+//     [count:u32]
+//     [count × (cluster_id:u32, dim × f32)]
+fn write_coarse_bin(
+    coarse_centroids: &[[f32; DIM]],
+    fine_centroids: &[[f32; DIM]],
+    coarse_asgn: &[usize],   // for each fine centroid: which coarse bucket it belongs to
+    path: &str,
+) -> std::io::Result<()> {
+    let n_coarse = coarse_centroids.len();
+    let n_fine = fine_centroids.len();
+
+    // quantize fine centroids to u8 — L1 via abs_diff (PSADBW) at query time
+    let mut buckets: Vec<Vec<(u32, [u8; DIM])>> = vec![Vec::new(); n_coarse];
+    for (fine_id, &ci) in coarse_asgn.iter().enumerate() {
+        let q: [u8; DIM] = std::array::from_fn(|j| quantize(fine_centroids[fine_id][j]));
+        buckets[ci].push((fine_id as u32, q));
+    }
+
+    let mut w = BufWriter::new(File::create(path)?);
+    w.write_all(&(n_coarse as u32).to_le_bytes())?;
+    w.write_all(&(n_fine as u32).to_le_bytes())?;
+    w.write_all(&(DIM as u32).to_le_bytes())?;
+
+    // coarse centroids as u8
+    for c in coarse_centroids {
+        let q: [u8; DIM] = std::array::from_fn(|j| quantize(c[j]));
+        w.write_all(&q)?;
+    }
+
+    for bucket in &buckets {
+        w.write_all(&(bucket.len() as u32).to_le_bytes())?;
+        for &(cluster_id, ref centroid) in bucket {
+            w.write_all(&cluster_id.to_le_bytes())?;
+            w.write_all(centroid)?;
+        }
+    }
+
+    w.flush()
+}
+
+// ivf.bin format:
+//   [n_clusters:u32][dim:u32]                       8 bytes header
+//   n_clusters × [offset:u64][count:u32][_pad:u32]  16 bytes each (offset table)
+//   data: cluster i at offset[i]: [count×DIM×u8][count×u8]
 fn write_ivf_bin(
     n_centroids: usize,
     float_vecs: &[[f32; DIM]],
@@ -240,113 +179,116 @@ fn write_ivf_bin(
     cluster_ids: &[usize],
     path: &str,
 ) -> std::io::Result<()> {
-    let mut w = BufWriter::new(File::create(path)?);
-    w.write_all(&(n_centroids as u32).to_le_bytes())?;
-    w.write_all(&(SLOTS_PER_CLUSTER as u32).to_le_bytes())?;
-    w.write_all(&(DIM as u32).to_le_bytes())?;
-
     let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); n_centroids];
     for (i, &ci) in cluster_ids.iter().enumerate() {
-        if clusters[ci].len() < SLOTS_PER_CLUSTER {
-            clusters[ci].push(i);
-        }
+        clusters[ci].push(i);
+    }
+
+    let data_start = 8u64 + n_centroids as u64 * 16;
+    let mut offsets = Vec::with_capacity(n_centroids);
+    let mut cur = data_start;
+    for cluster in &clusters {
+        offsets.push(cur);
+        let n = cluster.len();
+        cur += (n * DIM + n) as u64;
+    }
+
+    let mut w = BufWriter::new(File::create(path)?);
+    w.write_all(&(n_centroids as u32).to_le_bytes())?;
+    w.write_all(&(DIM as u32).to_le_bytes())?;
+
+    for (i, cluster) in clusters.iter().enumerate() {
+        w.write_all(&offsets[i].to_le_bytes())?;
+        w.write_all(&(cluster.len() as u32).to_le_bytes())?;
+        w.write_all(&0u32.to_le_bytes())?;
     }
 
     for cluster in &clusters {
-        w.write_all(&(cluster.len() as u32).to_le_bytes())?;
-        for slot in 0..SLOTS_PER_CLUSTER {
-            if slot < cluster.len() {
-                let vi = cluster[slot];
-                let q: [u8; DIM] = std::array::from_fn(|j| quantize(float_vecs[vi][j]));
-                w.write_all(&q)?;
-            } else {
-                w.write_all(&[0u8; DIM])?;
-            }
+        for &vi in cluster {
+            let q: [u8; DIM] = std::array::from_fn(|j| quantize(float_vecs[vi][j]));
+            w.write_all(&q)?;
         }
-        for slot in 0..SLOTS_PER_CLUSTER {
-            let label = if slot < cluster.len() { raw_labels[cluster[slot]] } else { 0 };
-            w.write_all(&[label])?;
+        for &vi in cluster {
+            w.write_all(&[raw_labels[vi]])?;
         }
     }
 
-    w.flush()
-}
-
-// graph.bin: [n:u32][m:u32][n_ep:u32][n_ep×u32] then per node: [m × (neighbor_idx:u32, dist:f32)]
-fn write_graph_bin(graph: &[[(u32, f32); M]], entry_points: &[u32], path: &str) -> std::io::Result<()> {
-    let mut w = BufWriter::new(File::create(path)?);
-    w.write_all(&(graph.len() as u32).to_le_bytes())?;
-    w.write_all(&(M as u32).to_le_bytes())?;
-    w.write_all(&(entry_points.len() as u32).to_le_bytes())?;
-    for &ep in entry_points { w.write_all(&ep.to_le_bytes())?; }
-    for node in graph {
-        for &(nb_idx, edge_dist) in node {
-            w.write_all(&nb_idx.to_le_bytes())?;
-            w.write_all(&edge_dist.to_le_bytes())?;
-        }
-    }
     w.flush()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    rayon::ThreadPoolBuilder::new().num_threads(6).build_global().unwrap();
+    rayon::ThreadPoolBuilder::new().num_threads(8).build_global().unwrap();
 
     let input = File::open("src/dataset/references.json")?;
     let records: Vec<Record> = serde_json::from_reader(std::io::BufReader::new(input))?;
     let n = records.len();
     println!("loaded {n} records");
-
-    let nlist = (n / SLOTS_PER_CLUSTER).max(1);
-    println!("nlist={nlist} ({SLOTS_PER_CLUSTER} slots/cluster)");
+    println!("nlist={NLIST} (~{} vectors/cluster avg)", n / NLIST);
 
     std::fs::create_dir_all("src/data")?;
 
     let float_vecs: Vec<[f32; DIM]> = records.iter().map(|r| r.vector).collect();
     let raw_labels: Vec<u8> = records.iter().map(|r| label_to_u8(&r.label)).collect();
 
-    println!("building centroids (nlist={nlist}, max_iter={MAX_ITER})...");
+    println!("building {NLIST} fine centroids (max_iter={MAX_ITER})...");
     let mut rng = SmallRng::seed_from_u64(42);
-    let centroids = kmeans(&float_vecs, nlist, MAX_ITER, &mut rng);
+    let fine_centroids = kmeans(&float_vecs, NLIST, MAX_ITER, &mut rng);
 
-    println!("assigning vectors to clusters...");
+    println!("assigning vectors to fine clusters...");
     let cluster_ids: Vec<usize> = float_vecs.par_iter()
-        .map(|v| nearest_idx(v, &centroids))
+        .map(|v| nearest_idx(v, &fine_centroids))
         .collect();
 
     let sizes: Vec<usize> = {
-        let mut c = vec![0usize; nlist];
+        let mut c = vec![0usize; NLIST];
         for &ci in &cluster_ids { c[ci] += 1; }
         c
     };
+    let mut sorted_sizes = sizes.clone();
+    sorted_sizes.sort_unstable();
+    let p99 = sorted_sizes[sorted_sizes.len() * 99 / 100];
     println!(
-        "cluster sizes: min={} max={} avg={:.1}",
+        "fine cluster sizes: min={} max={} avg={:.0} p99={}",
         sizes.iter().min().unwrap(),
         sizes.iter().max().unwrap(),
-        sizes.iter().sum::<usize>() as f64 / nlist as f64,
+        sizes.iter().sum::<usize>() as f64 / NLIST as f64,
+        p99,
+    );
+
+    println!("building {N_COARSE} coarse centroids over the {NLIST} fine centroids...");
+    let coarse_centroids = kmeans(&fine_centroids, N_COARSE, MAX_ITER, &mut rng);
+
+    let coarse_asgn: Vec<usize> = fine_centroids.par_iter()
+        .map(|c| nearest_idx(c, &coarse_centroids))
+        .collect();
+
+    let coarse_sizes: Vec<usize> = {
+        let mut c = vec![0usize; N_COARSE];
+        for &ci in &coarse_asgn { c[ci] += 1; }
+        c
+    };
+    println!(
+        "coarse bucket sizes: min={} max={} avg={:.0}",
+        coarse_sizes.iter().min().unwrap(),
+        coarse_sizes.iter().max().unwrap(),
+        coarse_sizes.iter().sum::<usize>() as f64 / N_COARSE as f64,
     );
 
     println!("writing centroids.bin...");
-    write_centroids_bin(&centroids, "src/data/centroids.bin")?;
-    println!("  {:.2} MB", (nlist * DIM * 4) as f64 / 1_048_576.0);
+    write_centroids_bin(&fine_centroids, "src/data/centroids.bin")?;
+    println!("  {:.2} MB", (NLIST * DIM * 4) as f64 / 1_048_576.0);
+
+    println!("writing coarse.bin...");
+    write_coarse_bin(&coarse_centroids, &fine_centroids, &coarse_asgn, "src/data/coarse.bin")?;
+    let coarse_size = std::fs::metadata("src/data/coarse.bin")?.len();
+    println!("  {:.2} KB", coarse_size as f64 / 1_024.0);
 
     println!("writing ivf.bin...");
-    write_ivf_bin(nlist, &float_vecs, &raw_labels, &cluster_ids, "src/data/ivf.bin")?;
-    let stride = 4 + SLOTS_PER_CLUSTER * (DIM + 1);
-    println!("  {:.2} MB (stride={stride} bytes/cluster)", (12 + nlist * stride) as f64 / 1_048_576.0);
+    write_ivf_bin(NLIST, &float_vecs, &raw_labels, &cluster_ids, "src/data/ivf.bin")?;
+    let ivf_size = std::fs::metadata("src/data/ivf.bin")?.len();
+    println!("  {:.2} MB", ivf_size as f64 / 1_048_576.0);
 
-    println!("building k-NN graph (M={M})...");
-    let graph = build_knn_graph(&centroids, &mut rng);
-
-    println!("farthest-point sampling {N_ENTRY_POINTS} entry points...");
-    let entry_points = farthest_point_sampling(&centroids, N_ENTRY_POINTS, &mut rng);
-
-    println!("writing graph.bin...");
-    write_graph_bin(&graph, &entry_points, "src/data/graph.bin")?;
-    println!(
-        "  {:.2} MB",
-        (12 + N_ENTRY_POINTS * 4 + nlist * M * 8) as f64 / 1_048_576.0,
-    );
-
-    println!("done — {n} vectors → {nlist} clusters");
+    println!("done — {n} vectors → {N_COARSE} coarse × {NLIST} fine clusters");
+    println!("search cost: {N_COARSE} + ~{} L2/query", NLIST / N_COARSE);
     Ok(())
 }
