@@ -1,28 +1,37 @@
-mod modules;
-
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-use axum::Router;
 use std::sync::Arc;
 
-use modules::fraud::{routes::router as fraud_router, service::FraudService};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use mimalloc::MiMalloc;
+use tokio::net::TcpListener;
 
-pub struct AppState {
-    pub fraud_service: Arc<FraudService>,
-}
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
-#[tokio::main(worker_threads = 1)]
+mod modules;
+use modules::fraud::service::FraudService;
+use modules::handler::handler;
+
+#[tokio::main]
 async fn main() {
     let service = Arc::new(FraudService::new());
-    let state = Arc::new(AppState { fraud_service: service });
+    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
 
-    let app = Router::new()
-        .merge(fraud_router())
-        .route("/ready", axum::routing::get(|| async { "OK" }))
-        .with_state(state);
+    println!("server running");
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let io = TokioIo::new(stream);
+        let service = Arc::clone(&service);
 
-    axum::serve(listener, app).await.unwrap();
+        tokio::spawn(async move {
+            if let Err(err) = http1::Builder::new()
+                .serve_connection(io, service_fn(move |req| handler(req, Arc::clone(&service))))
+                .await
+            {
+                eprintln!("connection error: {:?}", err);
+            }
+        });
+    }
 }

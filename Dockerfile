@@ -3,7 +3,6 @@ RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY scripts ./scripts
 RUN RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --bin backend-fight
 
 FROM alpine:3.21
