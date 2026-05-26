@@ -18,7 +18,7 @@ services:
           memory: "20MB"
 
   api1:
-    image: brunont1211/backend-fight:latest
+    image: brunont1211/image:latest
     expose:
       - "3000"
     healthcheck:
@@ -33,7 +33,7 @@ services:
           memory: "165MB"
 
   api2:
-    image: brunont1211/backend-fight:latest
+    image: brunont1211/image:latest
     expose:
       - "3000"
     healthcheck:
