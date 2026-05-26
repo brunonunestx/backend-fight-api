@@ -4,7 +4,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, Response};
 use hyper::body::Incoming;
-use crate::modules::fraud::service::FraudService;
+use crate::modules::fraud::service::{FraudService, DetectFraudResult};
 
 pub async fn handler(
     req: Request<Incoming>,
@@ -17,9 +17,13 @@ pub async fn handler(
         }
         (&Method::POST, "/fraud-score") => {
             let body = req.collect().await?.to_bytes();
-            let fraud_score = fraud_service.detect_fraud(&body);
+            let result: DetectFraudResult = fraud_service.detect_fraud(&body);
 
-            Ok(Response::new(Full::new(Bytes::from(fraud_score.to_string()))))
+            let json = serde_json::to_vec(&result)?;
+            Ok(Response::builder()
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from(json)))
+                .unwrap())
         }
         _ => Ok(Response::new(Full::new(Bytes::from("Method Not Allowed")))),
     }
